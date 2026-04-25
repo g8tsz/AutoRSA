@@ -3,6 +3,8 @@ import { createRoot } from 'react-dom/client'
 import App from './App'
 import './index.css'
 
+document.documentElement.dataset.theme = 'dark'
+
 const el = document.getElementById('root')
 if (!el) {
   throw new Error('#root not found')

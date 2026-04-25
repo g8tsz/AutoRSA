@@ -1,7 +1,24 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { buildCliArgs, formatCommandLine } from './lib/buildArgs'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { DashboardView } from './Dashboard'
+import {
+  healthLevel,
+  isReadyToRun,
+  useEnvironmentHealth,
+  type PathStatus
+} from './hooks/useEnvironmentHealth'
+import {
+  buildCliArgs,
+  formatCommandLine,
+  isEffectiveDry,
+  taskRunPreflight,
+  type BuildCliOpts
+} from './lib/buildArgs'
+import { missingEnvByBroker, parseBrokerList, taskUsesAllBrokers } from './lib/brokers'
+import { parseBrokerSignals } from './lib/parseBrokerSignals'
+import { OnboardingWizard } from './OnboardingWizard'
 import { trimLogEnd } from './lib/log'
-import type { AppSettings, Store, TaskGroup, TaskRow } from './types'
+import { SettingsPanel } from './SettingsPanel'
+import type { AppSettings, RsaRunResult, Store, TaskGroup, TaskRow } from './types'
 
 function newId(): string {
   return crypto.randomUUID()
@@ -14,6 +31,12 @@ const NAV = [
 ] as const
 
 type NavId = (typeof NAV)[number]['id']
+
+const PAGE: Record<NavId, { title: string; subtitle: string }> = {
+  dashboard: { title: 'Dashboard', subtitle: 'Live overview of tasks and recent runs' },
+  tasks: { title: 'Tasks', subtitle: 'Run buy, sell, and holdings against your brokerages' },
+  settings: { title: 'Settings', subtitle: 'Environment, CLI, and safety limits' }
+}
 
 const defaultGroup = (id: string): TaskGroup => ({ id, name: 'Default' })
 const defaultTask = (groupId: string): TaskRow => ({
@@ -39,9 +62,37 @@ export default function App(): React.JSX.Element {
   const [log, setLog] = useState<string>('')
   const [editId, setEditId] = useState<string | null>(null)
   const [running, setRunning] = useState(false)
+  const [taskDensity, setTaskDensity] = useState<'comfortable' | 'compact'>(() => {
+    try {
+      const v = localStorage.getItem('arsa_task_density')
+      return v === 'compact' || v === 'comfortable' ? v : 'comfortable'
+    } catch {
+      return 'comfortable'
+    }
+  })
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
+  const [taskFilter, setTaskFilter] = useState<'all' | 'errors'>('all')
+  const [startAllModalOpen, setStartAllModalOpen] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [tasksHelpOpen, setTasksHelpOpen] = useState(false)
+  const [pathsForOnboarding, setPathsForOnboarding] = useState<{
+    userData: string
+    projectRoot: string
+  } | null>(null)
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const maxLogRef = useRef(400_000)
   const cancelBatchRef = useRef(false)
+
+  const clock = useClock()
+  const health = useEnvironmentHealth(store?.settings ?? null)
+  const canRun = isReadyToRun(health)
+  const brokerSignals = useMemo(() => parseBrokerSignals(log), [log])
+  const runBlockedReason =
+    health == null
+      ? 'Checking paths on disk…'
+      : !canRun
+        ? 'Set a valid working directory and auto_rsa_bot in Settings (paths must exist on disk).'
+        : null
 
   const flushSave = useCallback(
     (s: Store) => {
@@ -68,15 +119,37 @@ export default function App(): React.JSX.Element {
   useEffect(() => {
     void window.api
       .storeLoad()
-      .then((s) => {
+      .then((raw) => {
+        const s: Store = {
+          ...raw,
+          runStats: raw.runStats ?? { ok: 0, err: 0 },
+          runHistory: Array.isArray(raw.runHistory) ? raw.runHistory.slice(0, 50) : [],
+          settings: {
+            ...raw.settings,
+            retryOnFailure: raw.settings.retryOnFailure ?? {
+              enabled: false,
+              maxAttempts: 2
+            },
+            brokerProfile: raw.settings.brokerProfile ?? {
+              include: 'all',
+              exclude: '',
+              applyToAllKeyword: true
+            },
+            riskGuard: raw.settings.riskGuard ?? { enabled: true, maxSharesPerOrder: 1 }
+          }
+        }
+        delete (s.settings as { theme?: unknown }).theme
         let g = s.groups
         let t = s.tasks
         if (g.length === 0) {
           const id = newId()
           g = [defaultGroup(id)]
           t = [defaultTask(id)]
-          s = { ...s, groups: g, tasks: t }
-          void window.api.storeSave(s)
+          const next = { ...s, groups: g, tasks: t }
+          void window.api.storeSave(next)
+          setStore(next)
+          setSelectedGroupId(g[0]!.id)
+          return
         }
         setStore(s)
         setSelectedGroupId(g[0]!.id)
@@ -84,7 +157,25 @@ export default function App(): React.JSX.Element {
       .catch((e) => {
         setLoadError(e instanceof Error ? e.message : String(e))
       })
+    void window.api.getPaths().then(setPathsForOnboarding)
   }, [])
+
+  useEffect(() => {
+    if (!store) return
+    const h = healthLevel(health)
+    const t =
+      h === 'ok'
+        ? 'AutoRSA Desktop'
+        : h === 'warn'
+          ? 'AutoRSA — Add .env'
+          : h === 'error'
+            ? 'AutoRSA — Check Settings'
+            : 'AutoRSA Desktop'
+    const st = window.api.setWindowTitle
+    if (typeof st === 'function') {
+      void st(t)
+    }
+  }, [store, health])
 
   useEffect(() => {
     if (!store || !selectedGroupId) return
@@ -103,7 +194,75 @@ export default function App(): React.JSX.Element {
     })
   }, [])
 
-  const clock = useClock()
+  useEffect(() => {
+    setSelectedTaskId(null)
+    setTaskFilter('all')
+  }, [selectedGroupId])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('arsa_task_density', taskDensity)
+    } catch {
+      /* ignore */
+    }
+  }, [taskDensity])
+
+  const tasks = useMemo(() => {
+    if (!store || !selectedGroupId) return [] as TaskRow[]
+    return store.tasks.filter(
+      (t) =>
+        t.groupId === selectedGroupId &&
+        (taskSearch === '' || t.name.toLowerCase().includes(taskSearch.toLowerCase()))
+    )
+  }, [store, selectedGroupId, taskSearch])
+
+  const displayTasks = useMemo(() => {
+    if (taskFilter === 'errors') {
+      return tasks.filter((t) => Boolean(t.lastError) || t.status === 'error')
+    }
+    return tasks
+  }, [tasks, taskFilter])
+
+  useEffect(() => {
+    if (nav !== 'tasks' || !store) return
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.target as HTMLElement).closest('input, textarea, select, [contenteditable=true]')) {
+        return
+      }
+      if (e.key === '?' || (e.key === '/' && e.shiftKey)) {
+        e.preventDefault()
+        setTasksHelpOpen(true)
+        return
+      }
+      if (e.key === 'j' || e.key === 'J') {
+        e.preventDefault()
+        const ids = displayTasks.map((t) => t.id)
+        if (ids.length === 0) return
+        const i = selectedTaskId ? ids.indexOf(selectedTaskId) : -1
+        setSelectedTaskId(ids[i < 0 ? 0 : Math.min(i + 1, ids.length - 1)]!)
+        return
+      }
+      if (e.key === 'k' || e.key === 'K') {
+        e.preventDefault()
+        const ids = displayTasks.map((t) => t.id)
+        if (ids.length === 0) return
+        const i = selectedTaskId != null ? ids.indexOf(selectedTaskId) : 0
+        setSelectedTaskId(ids[i <= 0 ? 0 : i - 1]!)
+        return
+      }
+      if (e.key === 'Enter' && selectedTaskId && !running && canRun) {
+        const row = store.tasks.find((x) => x.id === selectedTaskId)
+        if (row) {
+          e.preventDefault()
+          void runOne(row, store.settings, updateStore, setLog, setRunning, {
+            runOpts: resolveRunOpts(row, store.settings)
+          })
+        }
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [nav, store, displayTasks, selectedTaskId, running, canRun, updateStore])
 
   if (loadError) {
     return (
@@ -124,37 +283,30 @@ export default function App(): React.JSX.Element {
   const filteredGroups = store.groups.filter((g) =>
     g.name.toLowerCase().includes(groupSearch.toLowerCase())
   )
-  const tasks = store.tasks.filter(
-    (t) =>
-      t.groupId === selectedGroupId &&
-      (taskSearch === '' || t.name.toLowerCase().includes(taskSearch.toLowerCase()))
-  )
-
   const stats = {
     total: store.tasks.length,
     running: running ? 1 : 0,
     ok: store.tasks.filter((t) => t.status === 'ok').length,
     err: store.tasks.filter((t) => t.status === 'error').length
   }
-
   return (
-    <div className="flex h-screen overflow-hidden text-[13px]">
-      <aside className="flex w-56 shrink-0 flex-col border-r border-surface-border bg-[#0c0c0e]">
-        <div className="border-b border-surface-border px-3 py-3">
+    <div className="flex h-screen overflow-hidden bg-surface text-[13px] antialiased">
+      <aside className="flex w-56 shrink-0 flex-col border-r-2 border-surface-border bg-surface-raised">
+        <div className="border-b-2 border-surface-border px-3 py-3">
           <div className="text-xs font-semibold tracking-wide text-zinc-500">AutoRSA Desktop</div>
           <div className="text-[11px] text-zinc-600">1.0</div>
         </div>
-        <nav className="flex-1 space-y-0.5 p-2">
+        <nav className="flex-1 space-y-1 p-2">
           {NAV.map((item) => (
             <button
               key={item.id}
               type="button"
               onClick={() => setNav(item.id)}
               className={
-                'flex w-full items-center justify-between rounded-lg px-2 py-2 text-left ' +
+                'flex w-full items-center justify-between rounded-md border border-transparent px-2 py-2 text-left transition-colors duration-150 ' +
                 (nav === item.id
-                  ? 'bg-accent/15 text-indigo-200'
-                  : 'text-zinc-300 hover:bg-white/5')
+                  ? 'border-surface-border bg-surface text-indigo-200 shadow-sm'
+                  : 'text-zinc-300 hover:border-surface-border hover:bg-surface')
               }
             >
               <span>{item.label}</span>
@@ -162,34 +314,107 @@ export default function App(): React.JSX.Element {
             </button>
           ))}
         </nav>
-        <div className="space-y-2 border-t border-surface-border p-2 text-[11px] text-zinc-500">
-          <div>Python: check Settings</div>
+        <div className="space-y-2 border-t-2 border-surface-border p-2 text-[11px]">
+          <PythonStatusPill health={health} />
           <div className="font-mono text-[10px] text-zinc-600">{clock}</div>
         </div>
       </aside>
 
-      {nav === 'settings' && (
-        <SettingsPanel
-          settings={store.settings}
-          onChange={(settings) => updateStore((s) => ({ ...s, settings }))}
-        />
-      )}
+      <div className="main-view-fade flex min-h-0 min-w-0 flex-1 flex-col" key={nav}>
+        {nav === 'settings' && (
+          <>
+            <PageHeader title={PAGE.settings.title} subtitle={PAGE.settings.subtitle} />
+            <div className="min-h-0 flex-1 overflow-y-auto bg-surface">
+              <div className="mx-auto w-full max-w-3xl px-4 py-4 md:px-6">
+                <SettingsPanel
+                  settings={store.settings}
+                  onChange={(settings) => updateStore((s) => ({ ...s, settings }))}
+                  pathStatus={health}
+                  runStats={store.runStats}
+                />
+              </div>
+            </div>
+          </>
+        )}
 
-      {nav === 'dashboard' && (
-        <div className="flex flex-1 flex-col items-center justify-center bg-surface p-8 text-zinc-400">
-          <h1 className="mb-2 text-lg font-medium text-zinc-200">AutoRSA</h1>
-          <p className="max-w-md text-center text-sm">
-            Use Tasks to run buy, sell, or holdings commands against your configured brokerages.
-            Configure your <code className="text-indigo-300">.env</code> in Settings and install
-            the Python venv (see <code className="text-indigo-300">python/setup.ps1</code>).
-          </p>
-        </div>
-      )}
+        {nav === 'dashboard' && (
+          <>
+            <PageHeader
+              title={PAGE.dashboard.title}
+              subtitle={PAGE.dashboard.subtitle}
+              right={
+                <div className="flex flex-wrap justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setNav('tasks')}
+                    className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white shadow-sm transition-colors duration-150 hover:bg-indigo-500"
+                  >
+                    Open tasks
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setNav('settings')}
+                    className="rounded-md border border-surface-border bg-zinc-800/80 px-3 py-1.5 text-xs text-zinc-200 transition-colors duration-150 hover:bg-zinc-800"
+                  >
+                    Settings
+                  </button>
+                </div>
+              }
+            />
+            <div className="min-h-0 flex-1 overflow-y-auto bg-surface">
+              <div className="mx-auto w-full max-w-7xl">
+                <DashboardView
+                  store={store}
+                  running={running}
+                  setNav={setNav}
+                  onViewErrorTasks={() => {
+                    setTaskFilter('errors')
+                    setNav('tasks')
+                  }}
+                />
+              </div>
+            </div>
+          </>
+        )}
 
-      {nav === 'tasks' && (
-        <>
-          <section className="flex w-72 shrink-0 flex-col border-r border-surface-border bg-surface-raised/40">
-            <div className="flex items-center justify-between border-b border-surface-border px-2 py-2">
+        {nav === 'tasks' && (
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-surface">
+            <PageHeader
+              title={PAGE.tasks.title}
+              subtitle={PAGE.tasks.subtitle}
+              right={
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  {taskFilter === 'errors' && (
+                    <button
+                      type="button"
+                      className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-200"
+                      onClick={() => setTaskFilter('all')}
+                    >
+                      Showing errors only — clear
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    title="Command history"
+                    className="flex h-7 items-center justify-center rounded-md border border-surface-border bg-zinc-800 px-2 text-[10px] font-semibold text-zinc-300 hover:bg-zinc-700"
+                    onClick={() => setHistoryOpen((v) => !v)}
+                  >
+                    History
+                  </button>
+                  <button
+                    type="button"
+                    title="Keyboard shortcuts"
+                    className="flex h-7 w-7 items-center justify-center rounded-md border border-surface-border bg-zinc-800 text-xs font-semibold text-zinc-300 hover:bg-zinc-700"
+                    onClick={() => setTasksHelpOpen(true)}
+                  >
+                    ?
+                  </button>
+                </div>
+              }
+            />
+            <div className="mx-auto flex min-h-0 w-full max-w-[1920px] flex-1">
+          <section className="flex w-72 shrink-0 flex-col border-r-2 border-surface-border bg-surface-raised">
+            <div className="flex items-center justify-between border-b-2 border-surface-border px-2 py-2">
               <span className="pl-1 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
                 My task groups
               </span>
@@ -287,8 +512,8 @@ export default function App(): React.JSX.Element {
             </ul>
           </section>
 
-          <section className="flex min-w-0 flex-1 flex-col bg-surface">
-            <div className="flex flex-wrap items-center gap-2 border-b border-surface-border px-3 py-2">
+          <section className="flex min-w-0 flex-1 flex-col border-l border-surface-border bg-surface">
+            <div className="flex flex-wrap items-center gap-2 border-b-2 border-surface-border bg-surface-raised/50 px-3 py-2">
               <button
                 type="button"
                 onClick={() => {
@@ -304,18 +529,87 @@ export default function App(): React.JSX.Element {
               </button>
               <button
                 type="button"
-                onClick={() =>
-                  void runAll(
-                    tasks,
-                    store.settings,
-                    updateStore,
-                    setLog,
-                    setRunning,
-                    cancelBatchRef
-                  )
+                onClick={() => {
+                  if (!selectedGroupId) return
+                  const t = { ...defaultTask(selectedGroupId), name: 'holdings-safe', mode: 'holdings', dry: true }
+                  updateStore((s) => ({ ...s, tasks: [...s.tasks, t] }))
+                }}
+                className="rounded-md border border-surface-border bg-zinc-800 px-2 py-1.5 text-[11px] text-zinc-200 hover:bg-zinc-700"
+              >
+                + holdings-safe
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!selectedGroupId) return
+                  const t = {
+                    ...defaultTask(selectedGroupId),
+                    name: 'buy-small-dry',
+                    mode: 'buy' as const,
+                    amount: 1,
+                    tickers: 'aapl',
+                    dry: true
+                  }
+                  updateStore((s) => ({ ...s, tasks: [...s.tasks, t] }))
+                }}
+                className="rounded-md border border-surface-border bg-zinc-800 px-2 py-1.5 text-[11px] text-zinc-200 hover:bg-zinc-700"
+              >
+                + buy-small-dry
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!selectedGroupId) return
+                  const t = {
+                    ...defaultTask(selectedGroupId),
+                    name: 'sell-dry',
+                    mode: 'sell' as const,
+                    amount: 1,
+                    tickers: 'aapl',
+                    dry: true
+                  }
+                  updateStore((s) => ({ ...s, tasks: [...s.tasks, t] }))
+                }}
+                className="rounded-md border border-surface-border bg-zinc-800 px-2 py-1.5 text-[11px] text-zinc-200 hover:bg-zinc-700"
+              >
+                + sell-dry
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!selectedGroupId) return
+                  const t = {
+                    ...defaultTask(selectedGroupId),
+                    name: 'reverse-split-scan',
+                    mode: 'holdings' as const,
+                    brokers: 'day1',
+                    notBrokers: 'webull,wellsfargo',
+                    dry: true
+                  }
+                  updateStore((s) => ({ ...s, tasks: [...s.tasks, t] }))
+                }}
+                className="rounded-md border border-surface-border bg-zinc-800 px-2 py-1.5 text-[11px] text-zinc-200 hover:bg-zinc-700"
+              >
+                + reverse-split-scan
+              </button>
+              <button
+                type="button"
+                onClick={() => setStartAllModalOpen(true)}
+                disabled={running || tasks.length === 0 || !canRun}
+                title={
+                  runBlockedReason ??
+                  (running
+                    ? 'A command is already running.'
+                    : tasks.length === 0
+                      ? 'No tasks in this group.'
+                      : 'Run all tasks in this group in order')
                 }
-                disabled={running || tasks.length === 0}
-                className="rounded-md border border-surface-border bg-zinc-800 px-2 py-1.5 text-xs text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
+                className={
+                  'rounded-md px-3 py-1.5 text-xs font-medium transition-colors duration-150 ' +
+                  (canRun && !running && tasks.length > 0
+                    ? 'bg-accent text-white hover:bg-indigo-500 disabled:opacity-40'
+                    : 'border border-surface-border bg-zinc-800 text-zinc-200 hover:bg-zinc-700 disabled:opacity-40')
+                }
               >
                 Start all
               </button>
@@ -327,10 +621,39 @@ export default function App(): React.JSX.Element {
                   setRunning(false)
                 }}
                 disabled={!running}
-                className="rounded-md border border-surface-border bg-zinc-800 px-2 py-1.5 text-xs text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
+                className="rounded-md border border-surface-border bg-zinc-800 px-2 py-1.5 text-xs text-zinc-200 transition-colors duration-150 hover:bg-zinc-700 disabled:opacity-40"
               >
                 Stop
               </button>
+              <div
+                className="flex items-center gap-0.5 rounded-md border border-surface-border bg-[#0c0c0e] p-0.5"
+                title="Table row height"
+              >
+                <button
+                  type="button"
+                  onClick={() => setTaskDensity('comfortable')}
+                  className={
+                    'rounded px-1.5 py-0.5 text-[10px] transition-colors ' +
+                    (taskDensity === 'comfortable'
+                      ? 'bg-zinc-700 text-zinc-100'
+                      : 'text-zinc-500 hover:text-zinc-300')
+                  }
+                >
+                  Comfort
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTaskDensity('compact')}
+                  className={
+                    'rounded px-1.5 py-0.5 text-[10px] transition-colors ' +
+                    (taskDensity === 'compact'
+                      ? 'bg-zinc-700 text-zinc-100'
+                      : 'text-zinc-500 hover:text-zinc-300')
+                  }
+                >
+                  Compact
+                </button>
+              </div>
               <div className="ml-auto min-w-[180px] max-w-sm flex-1">
                 <input
                   className="w-full rounded-md border border-surface-border bg-[#0c0c0e] px-2 py-1.5 text-xs"
@@ -341,11 +664,19 @@ export default function App(): React.JSX.Element {
               </div>
             </div>
 
-            <div className="grid grid-cols-5 gap-2 border-b border-surface-border px-3 py-2">
+            <div className="grid grid-cols-5 gap-2 border-b-2 border-surface-border bg-surface px-3 py-2">
               <StatCard label="Total tasks" value={String(stats.total)} />
-              <StatCard label="Running" value={String(stats.running)} />
-              <StatCard label="Succeeded" value={String(stats.ok)} />
-              <StatCard label="Failed" value={String(stats.err)} />
+              <StatCard
+                label="Running"
+                value={String(stats.running)}
+                variant={stats.running > 0 ? 'warn' : 'default'}
+              />
+              <StatCard label="Succeeded" value={String(stats.ok)} variant="good" />
+              <StatCard
+                label="Failed"
+                value={String(stats.err)}
+                variant={stats.err > 0 ? 'bad' : 'default'}
+              />
               <StatCard
                 label="Group"
                 value={selectedGroup?.name ?? '—'}
@@ -354,33 +685,82 @@ export default function App(): React.JSX.Element {
             </div>
 
             <div className="min-h-0 flex-1 overflow-auto">
-              <table className="w-full border-collapse text-left text-xs">
+              <table
+                className={
+                  'w-full border-collapse text-left ' +
+                  (taskDensity === 'compact' ? 'text-[11px]' : 'text-xs')
+                }
+              >
                 <thead className="sticky top-0 bg-surface-raised/90 backdrop-blur">
                   <tr className="text-zinc-500">
-                    <th className="w-8 px-2 py-2" />
-                    <th className="px-2 py-2">Name</th>
-                    <th className="px-2 py-2">Mode</th>
-                    <th className="px-2 py-2">Brokers</th>
-                    <th className="px-2 py-2">Dry</th>
-                    <th className="px-2 py-2">Status</th>
-                    <th className="w-40 px-2 py-2 text-right">Actions</th>
+                    <th
+                      className={
+                        'w-8 px-2 ' + (taskDensity === 'compact' ? 'py-1' : 'py-2')
+                      }
+                    />
+                    <th className={'px-2 ' + (taskDensity === 'compact' ? 'py-1' : 'py-2')}>
+                      Name
+                    </th>
+                    <th className={'px-2 ' + (taskDensity === 'compact' ? 'py-1' : 'py-2')}>
+                      Mode
+                    </th>
+                    <th className={'px-2 ' + (taskDensity === 'compact' ? 'py-1' : 'py-2')}>
+                      Brokers
+                    </th>
+                    <th className={'px-2 ' + (taskDensity === 'compact' ? 'py-1' : 'py-2')}>
+                      Dry
+                    </th>
+                    <th className={'px-2 ' + (taskDensity === 'compact' ? 'py-1' : 'py-2')}>
+                      Status
+                    </th>
+                    <th
+                      className={
+                        'w-40 px-2 text-right ' + (taskDensity === 'compact' ? 'py-1' : 'py-2')
+                      }
+                    >
+                      Actions
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
-                  {tasks.map((t) => (
+                  {displayTasks.map((t) => {
+                    const py = taskDensity === 'compact' ? 'py-1' : 'py-1.5'
+                    const selected = t.id === selectedTaskId
+                    return (
                     <tr
                       key={t.id}
-                      className="border-b border-surface-border/60 hover:bg-white/[0.02]"
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault()
+                          setSelectedTaskId(t.id)
+                        }
+                      }}
+                      onClick={() => setSelectedTaskId(t.id)}
+                      className={
+                        'cursor-pointer border-b border-surface-border/60 transition-colors duration-150 ' +
+                        (selected
+                          ? 'bg-indigo-500/10 ring-1 ring-inset ring-indigo-500/30 hover:bg-indigo-500/15'
+                          : 'hover:bg-white/[0.03]')
+                      }
                     >
-                      <td className="px-2 py-1.5" />
-                      <td className="px-2 py-1.5 font-medium text-zinc-200">{t.name}</td>
-                      <td className="px-2 py-1.5 capitalize text-zinc-400">{t.mode}</td>
-                      <td className="max-w-[140px] truncate px-2 py-1.5 font-mono text-[11px] text-zinc-500">
+                      <td className={'px-2 ' + py} />
+                      <td className={'px-2 font-medium text-zinc-200 ' + py}>{t.name}</td>
+                      <td className={'px-2 capitalize text-zinc-400 ' + py}>{t.mode}</td>
+                      <td
+                        className={
+                          'max-w-[140px] truncate px-2 font-mono text-zinc-500 ' +
+                          py +
+                          ' ' +
+                          (taskDensity === 'compact' ? 'text-[10px]' : 'text-[11px]')
+                        }
+                      >
                         {t.brokers}
                         {t.notBrokers ? ` (not ${t.notBrokers})` : ''}
                       </td>
-                      <td className="px-2 py-1.5 text-zinc-400">{t.dry ? 'Yes' : 'No'}</td>
-                      <td className="px-2 py-1.5">
+                      <td className={'px-2 text-zinc-400 ' + py}>{t.dry ? 'Yes' : 'No'}</td>
+                      <td className={'px-2 ' + py}>
                         <span
                           className={
                             'inline-flex rounded px-1.5 py-0.5 text-[10px] uppercase ' +
@@ -396,39 +776,47 @@ export default function App(): React.JSX.Element {
                           {t.status}
                         </span>
                       </td>
-                      <td className="px-2 py-1.5 text-right">
+                      <td className={'px-2 text-right ' + py}>
                         <div className="inline-flex gap-1">
                           <button
                             type="button"
-                            className="rounded border border-surface-border px-1.5 py-0.5 hover:bg-zinc-800"
-                            title="Run"
-                            onClick={() =>
+                            className="rounded border border-surface-border px-1.5 py-0.5 transition-colors hover:bg-zinc-800"
+                            title={
+                              runBlockedReason ?? (running ? 'A command is already running.' : 'Run this task')
+                            }
+                            onClick={(e) => {
+                              e.stopPropagation()
                               void runOne(
                                 t,
                                 store.settings,
                                 updateStore,
                                 setLog,
-                                setRunning
+                                setRunning,
+                                { runOpts: resolveRunOpts(t, store.settings) }
                               )
-                            }
-                            disabled={running}
+                            }}
+                            disabled={running || !canRun}
                           >
                             ▶
                           </button>
                           <button
                             type="button"
-                            className="rounded border border-surface-border px-1.5 py-0.5 hover:bg-zinc-800"
+                            className="rounded border border-surface-border px-1.5 py-0.5 transition-colors hover:bg-zinc-800"
                             title="Edit"
-                            onClick={() => setEditId(t.id)}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setEditId(t.id)
+                            }}
                             disabled={running}
                           >
                             ✎
                           </button>
                           <button
                             type="button"
-                            className="rounded border border-surface-border px-1.5 py-0.5 hover:bg-zinc-800"
+                            className="rounded border border-surface-border px-1.5 py-0.5 transition-colors hover:bg-zinc-800"
                             title="Duplicate"
-                            onClick={() => {
+                            onClick={(e) => {
+                              e.stopPropagation()
                               const copy: TaskRow = {
                                 ...t,
                                 id: newId(),
@@ -445,9 +833,10 @@ export default function App(): React.JSX.Element {
                           </button>
                           <button
                             type="button"
-                            className="rounded border border-surface-border px-1.5 py-0.5 hover:bg-zinc-800"
+                            className="rounded border border-surface-border px-1.5 py-0.5 transition-colors hover:bg-zinc-800"
                             title="Delete"
-                            onClick={() => {
+                            onClick={(e) => {
+                              e.stopPropagation()
                               if (confirm('Delete this task?')) {
                                 updateStore((s) => ({
                                   ...s,
@@ -462,14 +851,33 @@ export default function App(): React.JSX.Element {
                         </div>
                       </td>
                     </tr>
-                  ))}
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
 
-            <div className="h-40 shrink-0 border-t border-surface-border bg-[#0a0a0c] p-2">
-              <div className="mb-1 flex items-center justify-between text-[11px] text-zinc-500">
+            <div className="h-44 shrink-0 border-t-2 border-surface-border bg-surface-raised p-2">
+              <div className="mb-1 flex items-center justify-between border-b border-surface-border pb-1 text-[11px] font-medium uppercase tracking-wide text-zinc-500">
                 <span>Output</span>
+                <div className="ml-2 flex flex-wrap gap-1">
+                  {brokerSignals.map((b) => (
+                    <span
+                      key={b.broker}
+                      className={
+                        'rounded px-1.5 py-0.5 text-[10px] lowercase ' +
+                        (b.status === 'ok'
+                          ? 'bg-emerald-500/20 text-emerald-300'
+                          : b.status === 'error'
+                            ? 'bg-red-500/20 text-red-300'
+                            : 'bg-amber-500/20 text-amber-200')
+                      }
+                      title={b.detail ?? ''}
+                    >
+                      {b.broker}:{b.status}
+                    </span>
+                  ))}
+                </div>
                 <button
                   type="button"
                   className="text-indigo-400 hover:text-indigo-300"
@@ -478,12 +886,167 @@ export default function App(): React.JSX.Element {
                   Clear
                 </button>
               </div>
-              <pre className="h-[calc(100%-1.5rem)] overflow-auto font-mono text-[11px] text-zinc-300">
+              <pre className="mt-1 h-[calc(100%-2.25rem)] overflow-auto rounded-sm border border-surface-border bg-[#0a0a0c] p-2 font-mono text-[11px] text-zinc-300">
                 {log || 'Run a task to see output.'}
               </pre>
             </div>
+            {historyOpen && (
+              <div className="h-52 shrink-0 border-t-2 border-surface-border bg-surface p-2">
+                <div className="mb-1 text-[11px] font-medium uppercase tracking-wide text-zinc-500">
+                  Command history
+                </div>
+                <div className="h-[calc(100%-1.5rem)] overflow-auto rounded-sm border border-surface-border bg-[#0a0a0c]">
+                  {store.runHistory == null || store.runHistory.length === 0 ? (
+                    <p className="p-2 text-xs text-zinc-500">No runs yet.</p>
+                  ) : (
+                    <table className="w-full text-left text-[11px]">
+                      <thead className="sticky top-0 bg-[#111114] text-zinc-500">
+                        <tr>
+                          <th className="px-2 py-1">When</th>
+                          <th className="px-2 py-1">Task</th>
+                          <th className="px-2 py-1">Result</th>
+                          <th className="px-2 py-1">Cmd</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {store.runHistory.map((h) => (
+                          <tr key={h.id} className="border-t border-surface-border/60">
+                            <td className="px-2 py-1 text-zinc-400">{new Date(h.createdAt).toLocaleTimeString()}</td>
+                            <td className="px-2 py-1 text-zinc-300">{h.taskName}</td>
+                            <td className={'px-2 py-1 ' + (h.ok ? 'text-emerald-300' : 'text-red-300')}>
+                              {h.ok ? 'ok' : 'error'} · {h.code}
+                              {h.exitKind ? ` (${h.exitKind})` : ''}
+                            </td>
+                            <td className="px-2 py-1 font-mono text-zinc-500">{h.commandLine}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+            )}
           </section>
-        </>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {store.onboardingComplete === false && (
+        <OnboardingWizard
+          settings={store.settings}
+          onPickEnvDir={async () => {
+            const p = await window.api.pickDirectory()
+            if (p) updateStore((s) => ({ ...s, settings: { ...s.settings, envDirectory: p } }))
+          }}
+          onOpenProjectRoot={() => {
+            if (pathsForOnboarding) void window.api.openPath(pathsForOnboarding.projectRoot)
+          }}
+          onDone={() => updateStore((s) => ({ ...s, onboardingComplete: true }))}
+        />
+      )}
+
+      {startAllModalOpen && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70 p-4">
+          <div
+            className="w-full max-w-md rounded-md border-2 border-surface-border p-5 shadow-xl"
+            style={{ background: 'rgb(var(--color-surface-raised) / 1)' }}
+          >
+            <h2 className="text-sm font-semibold text-zinc-100">Start all — review</h2>
+            <ul className="mt-3 list-disc space-y-1.5 pl-4 text-xs text-zinc-400">
+              <li>Tasks in this group: {tasks.length}</li>
+              <li>
+                Paths:{' '}
+                {canRun ? (
+                  <span className="text-emerald-400">ready</span>
+                ) : (
+                  <span className="text-amber-300">not ready (see Settings)</span>
+                )}
+              </li>
+              <li>
+                Global dry mode: {store.settings.forceDryRun ? 'on (live orders blocked)' : 'off'}
+              </li>
+              <li>Live (non-dry) tasks in list: {tasks.filter((t) => !isEffectiveDry(t, store.settings)).length}</li>
+              <li>
+                Retries on failure:{' '}
+                {store.settings.retryOnFailure.enabled
+                  ? `on (max ${store.settings.retryOnFailure.maxAttempts} attempts per task)`
+                  : 'off'}
+              </li>
+            </ul>
+            <p className="mt-2 text-[11px] text-zinc-500">
+              Tasks run in list order. You can still press Stop to interrupt.
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                className="rounded-md border border-surface-border px-3 py-1.5 text-xs"
+                onClick={() => setStartAllModalOpen(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white"
+                onClick={() => {
+                  setStartAllModalOpen(false)
+                  void runAll(
+                    tasks,
+                    store.settings,
+                    updateStore,
+                    setLog,
+                    setRunning,
+                    cancelBatchRef
+                  )
+                }}
+              >
+                Run all
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {tasksHelpOpen && (
+        <div
+          className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70 p-4"
+          onClick={() => setTasksHelpOpen(false)}
+        >
+          <div
+            className="w-full max-w-sm rounded-md border-2 border-surface-border p-4 text-xs shadow-xl"
+            style={{ background: 'rgb(var(--color-surface-raised) / 1)' }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="text-sm font-semibold text-zinc-100">Tasks shortcuts</h2>
+            <p className="mt-2 text-zinc-500">
+              Brokers <code className="text-indigo-300">all</code> runs every integration AutoRSA
+              supports; each needs matching variables in your <code className="text-indigo-300">.env</code>
+              . Use specific brokers, or <code className="text-indigo-300">all</code> plus{' '}
+              <strong>Exclude brokers</strong> (e.g. <code className="text-indigo-300">webull,wellsfargo</code>
+              ) to skip ones you do not use.
+            </p>
+            <p className="mt-2 text-zinc-500">With focus not in an input field:</p>
+            <ul className="mt-2 space-y-1.5 text-zinc-300">
+              <li>
+                <kbd className="rounded bg-zinc-800 px-1">j</kbd> /{' '}
+                <kbd className="rounded bg-zinc-800 px-1">k</kbd> — move selection down / up
+              </li>
+              <li>
+                <kbd className="rounded bg-zinc-800 px-1">Enter</kbd> — run selected task
+              </li>
+              <li>
+                <kbd className="rounded bg-zinc-800 px-1">?</kbd> — this help
+              </li>
+            </ul>
+            <button
+              type="button"
+              className="mt-4 w-full rounded-md border border-surface-border py-1.5 text-zinc-300"
+              onClick={() => setTasksHelpOpen(false)}
+            >
+              Close
+            </button>
+          </div>
+        </div>
       )}
 
       {editId && (() => {
@@ -510,18 +1073,109 @@ export default function App(): React.JSX.Element {
 function StatCard({
   label,
   value,
-  small
+  small,
+  variant
 }: {
   label: string
   value: string
   small?: boolean
+  variant?: 'default' | 'good' | 'bad' | 'warn'
 }): React.JSX.Element {
+  const shell =
+    variant === 'good'
+      ? 'border border-emerald-500/20 bg-emerald-500/5'
+      : variant === 'bad'
+        ? 'border border-red-500/25 bg-red-500/5'
+        : variant === 'warn'
+          ? 'border border-amber-500/25 bg-amber-500/5'
+          : 'border-2 border-surface-border bg-surface-raised'
   return (
-    <div className="rounded-lg border border-surface-border bg-surface-raised/80 px-2 py-2">
+    <div className={'rounded-lg px-2 py-2 transition-colors duration-150 ' + shell}>
       <div className="text-[10px] uppercase text-zinc-500">{label}</div>
-      <div className={small ? 'truncate text-sm text-zinc-200' : 'text-lg font-semibold text-zinc-100'}>
+      <div
+        className={
+          small
+            ? 'truncate text-sm text-zinc-200'
+            : 'text-lg font-semibold tabular-nums text-zinc-100'
+        }
+      >
         {value}
       </div>
+    </div>
+  )
+}
+
+function PageHeader({
+  title,
+  subtitle,
+  right
+}: {
+  title: string
+  subtitle: string
+  right?: React.ReactNode
+}): React.JSX.Element {
+  return (
+    <header className="shrink-0 border-b-2 border-surface-border bg-surface-raised px-4 py-3">
+      <div className="mx-auto flex w-full max-w-7xl flex-wrap items-end justify-between gap-3">
+        <div className="min-w-0">
+          <h1 className="truncate text-base font-semibold text-zinc-100">{title}</h1>
+          <p className="text-[11px] text-zinc-500">{subtitle}</p>
+        </div>
+        {right}
+      </div>
+    </header>
+  )
+}
+
+function PythonStatusPill({ health }: { health: PathStatus | null }): React.JSX.Element {
+  const level = healthLevel(health)
+  const detail =
+    health == null
+      ? 'Verifying working directory, .env, and auto_rsa_bot on disk.'
+      : [
+          `Working dir: ${health.envDirExists ? 'ok' : 'missing'}`,
+          `.env: ${health.envFileExists ? 'ok' : 'missing'}`,
+          `CLI: ${health.exeExists ? 'ok' : 'missing'}`,
+          health.exeExists && health.botResolvedSummary ? health.botResolvedSummary : null,
+          !health.exeExists && health.botSetupHint ? health.botSetupHint : null
+        ]
+          .filter(Boolean)
+          .join(' · ')
+  const label =
+    level === 'loading'
+      ? 'Status…'
+      : level === 'ok'
+        ? 'Ready'
+        : level === 'warn'
+          ? 'No .env'
+          : 'Fix setup'
+  const color =
+    level === 'loading'
+      ? 'border-zinc-600 bg-zinc-800/60 text-zinc-400'
+      : level === 'ok'
+        ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200/90'
+        : level === 'warn'
+          ? 'border-amber-500/40 bg-amber-500/10 text-amber-200/90'
+          : 'border-red-500/40 bg-red-500/10 text-red-200/90'
+  return (
+    <div
+      className={'inline-flex max-w-full items-center gap-1.5 rounded-full border px-2 py-1 ' + color}
+      title={detail}
+    >
+      <span
+        className={
+          'h-1.5 w-1.5 shrink-0 rounded-full ' +
+          (level === 'loading'
+            ? 'animate-pulse bg-zinc-500'
+            : level === 'ok'
+              ? 'bg-emerald-400'
+              : level === 'warn'
+                ? 'bg-amber-400'
+                : 'bg-red-400')
+        }
+        aria-hidden
+      />
+      <span className="truncate text-[10px] font-medium leading-none">{label}</span>
     </div>
   )
 }
@@ -538,7 +1192,7 @@ function TaskEditor({
   const [d, setD] = useState<TaskRow>(task)
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="w-full max-w-md rounded-xl border border-surface-border bg-[#12121a] p-4 shadow-xl">
+      <div className="w-full max-w-md rounded-md border-2 border-surface-border bg-surface-raised p-4 shadow-xl">
         <h2 className="mb-3 text-sm font-semibold text-zinc-200">Edit task</h2>
         <div className="space-y-2 text-xs">
           <Labeled
@@ -575,12 +1229,12 @@ function TaskEditor({
             </>
           )}
           <Labeled
-            label="Brokers (e.g. all, day1, robinhood,schwab)"
+            label="Brokers (comma-separated, or keywords: all, day1, most — all needs every .env broker)"
             value={d.brokers}
             onChange={(v) => setD((x) => ({ ...x, brokers: v }))}
           />
           <Labeled
-            label="Exclude brokers (optional, comma)"
+            label="Exclude brokers (optional; e.g. webull,wellsfargo when using all)"
             value={d.notBrokers}
             onChange={(v) => setD((x) => ({ ...x, notBrokers: v }))}
           />
@@ -635,129 +1289,6 @@ function Labeled({
   )
 }
 
-function SettingsPanel({
-  settings,
-  onChange
-}: {
-  settings: AppSettings
-  onChange: (s: AppSettings) => void
-}): React.JSX.Element {
-  const [paths, setPaths] = useState<{ userData: string; projectRoot: string } | null>(null)
-  useEffect(() => {
-    void window.api.getPaths().then(setPaths)
-  }, [])
-  return (
-    <div className="flex-1 space-y-4 overflow-y-auto bg-surface p-6 text-sm text-zinc-300">
-      <h1 className="text-base font-semibold text-zinc-100">Settings</h1>
-      <p className="max-w-2xl text-xs text-zinc-500">
-        AutoRSA reads broker credentials from a <code className="text-indigo-300">.env</code> file in
-        the <strong>working directory</strong> you set below. Put broker cookies in a{' '}
-        <code className="text-indigo-300">creds</code> folder next to that <code>.env</code> if the
-        upstream project expects it — see the{' '}
-        <button
-          type="button"
-          className="text-indigo-400 underline hover:text-indigo-300"
-          onClick={() => void window.api.openExternal('https://github.com/NelsonDane/auto-rsa')}
-        >
-          AutoRSA README
-        </button>
-        . Python 3.12+ is required for <code>auto_rsa_bot</code>.
-      </p>
-      <p className="max-w-2xl text-xs text-amber-200/80">
-        This app spawns the CLI with <code className="text-amber-100">DANGER_MODE=true</code> so the
-        Python process does not wait for a second terminal confirmation. Rely on <strong>dry run</strong>{' '}
-        and the confirmation dialogs here before live orders.
-      </p>
-      <div>
-        <div className="text-xs text-zinc-500">.env directory (working directory for CLI)</div>
-        <div className="mt-1 flex gap-2">
-          <input
-            readOnly
-            className="min-w-0 flex-1 rounded border border-surface-border bg-[#0c0c0e] px-2 py-1.5 font-mono text-xs"
-            value={settings.envDirectory}
-          />
-          <button
-            type="button"
-            className="shrink-0 rounded-md border border-surface-border bg-zinc-800 px-2 py-1 text-xs"
-            onClick={async () => {
-              const p = await window.api.pickDirectory()
-              if (p) onChange({ ...settings, envDirectory: p })
-            }}
-          >
-            Browse
-          </button>
-          <button
-            type="button"
-            className="shrink-0 rounded-md border border-surface-border bg-zinc-800 px-2 py-1 text-xs"
-            onClick={() => void window.api.openPath(settings.envDirectory)}
-          >
-            Open
-          </button>
-        </div>
-      </div>
-      <div>
-        <div className="text-xs text-zinc-500">auto_rsa_bot executable</div>
-        <div className="mt-1 flex gap-2">
-          <input
-            readOnly
-            className="min-w-0 flex-1 rounded border border-surface-border bg-[#0c0c0e] px-2 py-1.5 font-mono text-xs"
-            value={settings.autoRsaExecutable}
-          />
-          <button
-            type="button"
-            className="shrink-0 rounded-md border border-surface-border bg-zinc-800 px-2 py-1 text-xs"
-            onClick={async () => {
-              const p = await window.api.pickExecutable()
-              if (p) onChange({ ...settings, autoRsaExecutable: p })
-            }}
-          >
-            Browse
-          </button>
-        </div>
-      </div>
-      <div className="max-w-md">
-        <div className="text-xs text-zinc-500">Max log size (characters)</div>
-        <input
-          type="number"
-          min={5_000}
-          step={1_000}
-          className="mt-0.5 w-full rounded border border-surface-border bg-[#0c0c0e] px-2 py-1.5 font-mono text-xs"
-          value={settings.maxLogChars}
-          onChange={(e) => {
-            const n = Math.max(5_000, Math.floor(Number(e.target.value) || 0))
-            onChange({ ...settings, maxLogChars: n })
-          }}
-        />
-        <p className="mt-0.5 text-[11px] text-zinc-600">Older output is dropped from the top when full.</p>
-      </div>
-      <div className="max-w-md">
-        <div className="text-xs text-zinc-500">Command timeout (seconds, 0 = off)</div>
-        <input
-          type="number"
-          min={0}
-          step={30}
-          className="mt-0.5 w-full rounded border border-surface-border bg-[#0c0c0e] px-2 py-1.5 font-mono text-xs"
-          value={settings.commandTimeoutSec}
-          onChange={(e) => {
-            const n = Math.max(0, Math.floor(Number(e.target.value) || 0))
-            onChange({ ...settings, commandTimeoutSec: n })
-          }}
-        />
-        <p className="mt-0.5 text-[11px] text-zinc-600">
-          Kills a stuck <code>auto_rsa_bot</code> after this time. Use 0 to disable, or 3600+ for
-          long broker flows.
-        </p>
-      </div>
-      {paths && (
-        <div className="text-[11px] text-zinc-600">
-          <div>User data: {paths.userData}</div>
-          <div>App root: {paths.projectRoot}</div>
-        </div>
-      )}
-    </div>
-  )
-}
-
 function useClock(): string {
   const [t, setT] = useState(() => new Date().toLocaleString())
   useEffect(() => {
@@ -777,27 +1308,92 @@ function appendWithCap(
   setLog((prev) => trimLogEnd(prev + add, max))
 }
 
+function uniqCsv(...vals: Array<string | undefined>): string {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const v of vals) {
+    for (const p of (v ?? '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean)) {
+      if (seen.has(p)) continue
+      seen.add(p)
+      out.push(p)
+    }
+  }
+  return out.join(',')
+}
+
+function resolveRunOpts(task: TaskRow, settings: AppSettings): BuildCliOpts {
+  if (!taskUsesAllBrokers(task) || !settings.brokerProfile.applyToAllKeyword) return {}
+  return {
+    brokerOverride: settings.brokerProfile.include.trim() || 'all',
+    notBrokersOverride: uniqCsv(task.notBrokers, settings.brokerProfile.exclude)
+  }
+}
+
 async function runOne(
   t: TaskRow,
   settings: AppSettings,
   updateStore: (u: (p: Store) => Store) => void,
   setLog: (s: string | ((p: string) => string)) => void,
   setRunning: (v: boolean) => void,
-  opts?: { batch?: boolean; cancelRef?: { current: boolean } }
+  opts?: { batch?: boolean; cancelRef?: { current: boolean }; runOpts?: BuildCliOpts }
 ): Promise<RunResult> {
-  if (!t.dry && !opts?.batch) {
-    const ok = confirm('This task is NOT a dry run. Real orders may be sent. Continue?')
+  const runOpts = opts?.runOpts
+  const preflight = taskRunPreflight(t, runOpts)
+  if (preflight) {
+    appendWithCap(
+      setLog,
+      settings.maxLogChars,
+      `\n--- ${t.name} ---\n${preflight}\n\n— Summary: ${t.name} · skipped · not run —\n`
+    )
+    return 'aborted'
+  }
+  const argsPreview = buildCliArgs(t, settings, runOpts)
+  if (
+    settings.riskGuard.enabled &&
+    !isEffectiveDry(t, settings) &&
+    (t.mode === 'buy' || t.mode === 'sell') &&
+    t.amount > settings.riskGuard.maxSharesPerOrder
+  ) {
+    appendWithCap(
+      setLog,
+      settings.maxLogChars,
+      `\n--- ${t.name} ---\nBlocked by risk guard: ${t.mode} amount ${t.amount} exceeds max live shares (${settings.riskGuard.maxSharesPerOrder}).\n\n— Summary: ${t.name} · blocked · risk guard —\n`
+    )
+    return 'aborted'
+  }
+  const selectedBrokers = parseBrokerList(runOpts?.brokerOverride ?? t.brokers)
+  const envSummary = await window.api.envSummary({ envDirectory: settings.envDirectory })
+  const missingByBroker = missingEnvByBroker(selectedBrokers, envSummary.keys)
+  const missingLines = Object.entries(missingByBroker)
+    .map(([b, keys]) => `${b}: ${keys.join(', ')}`)
+    .join('\n')
+  const live = !isEffectiveDry(t, settings)
+  const preflightLines = [
+    `Task: ${t.name}`,
+    `Mode: ${t.mode}`,
+    `Command: ${formatCommandLine(settings.autoRsaExecutable, argsPreview)}`,
+    `cwd: ${envSummary.cwd}`,
+    `Brokers: ${selectedBrokers.join(', ') || '(none)'}`,
+    `Run type: ${live ? 'LIVE' : 'DRY'}`,
+    missingLines ? `Missing .env vars:\n${missingLines}` : 'Missing .env vars: none'
+  ].join('\n')
+  const needsConfirm = !opts?.batch || live || Object.keys(missingByBroker).length > 0
+  if (needsConfirm) {
+    const ok = confirm(
+      preflightLines +
+        (live
+          ? '\n\nThis is a LIVE run. Confirm to continue.'
+          : '\n\nConfirm to run.')
+    )
     if (!ok) return 'aborted'
   }
   if (opts?.cancelRef?.current) return 'cancelled'
 
   const max = settings.maxLogChars
-  const args = buildCliArgs(t)
-  appendWithCap(
-    setLog,
-    max,
-    `\n--- ${t.name} ---\n$ ${formatCommandLine(settings.autoRsaExecutable, args)}\n`
-  )
+  const maxTries = settings.retryOnFailure.enabled
+    ? Math.max(1, Math.min(20, settings.retryOnFailure.maxAttempts))
+    : 1
+
   if (!opts?.batch) {
     setRunning(true)
   }
@@ -807,13 +1403,62 @@ async function runOne(
       tasks: s.tasks.map((x) => (x.id === t.id ? { ...x, status: 'running' as const } : x))
     }))
 
-    const toSec = settings.commandTimeoutSec
-    const res = await window.api.rsaRun({
-      args,
-      cwd: settings.envDirectory,
-      autoRsaExecutable: settings.autoRsaExecutable,
-      timeoutMs: toSec > 0 ? toSec * 1000 : undefined
-    })
+    const t0 = Date.now()
+    let lastRes: RsaRunResult | null = null
+
+    for (let attempt = 1; attempt <= maxTries; attempt++) {
+      if (opts?.cancelRef?.current) return 'cancelled'
+
+      const args = buildCliArgs(t, settings, runOpts)
+      if (attempt === 1) {
+        appendWithCap(
+          setLog,
+          max,
+          `\n--- ${t.name} ---\n$ ${formatCommandLine(settings.autoRsaExecutable, args)}\n`
+        )
+        if ((runOpts?.notBrokersOverride ?? '').trim().length > 0) {
+          appendWithCap(setLog, max, `Skipped brokers: ${(runOpts?.notBrokersOverride ?? '').trim()}\n`)
+        }
+      } else {
+        appendWithCap(setLog, max, `\n— Retry ${attempt}/${maxTries} —\n`)
+      }
+
+      const toSec = settings.commandTimeoutSec
+      const res = await window.api.rsaRun({
+        args,
+        cwd: settings.envDirectory,
+        autoRsaExecutable: settings.autoRsaExecutable,
+        timeoutMs: toSec > 0 ? toSec * 1000 : undefined
+      })
+      lastRes = res
+
+      if (res.error) {
+        appendWithCap(setLog, max, res.error + '\n')
+      }
+
+      if (res.ok) break
+      if (!settings.retryOnFailure.enabled) break
+      if (attempt >= maxTries) break
+      if (res.exitKind === 'user_stopped' || res.exitKind === 'timeout') break
+    }
+
+    const res = lastRes!
+    const elapsedSec = ((Date.now() - t0) / 1000).toFixed(1)
+    const summaryLine = `— Summary: ${t.name} · ${res.ok ? 'ok' : 'error'} · exit ${res.code} · ${elapsedSec}s${
+      maxTries > 1 ? ` · up to ${maxTries} attempts` : ''
+    } —`
+    appendWithCap(setLog, max, `\n${summaryLine}\n`)
+    if (res.exitKind && res.exitKind !== 'normal') {
+      appendWithCap(setLog, max, `(exit kind: ${res.exitKind})\n`)
+    }
+
+    const errLine =
+      res.error ??
+      (!res.ok
+        ? res.exitKind === 'user_stopped'
+          ? 'Stopped'
+          : `exit ${res.code}`
+        : undefined)
 
     updateStore((s) => ({
       ...s,
@@ -822,16 +1467,34 @@ async function runOne(
           ? {
               ...x,
               status: res.ok ? 'ok' : 'error',
-              lastError: res.error ?? (res.ok ? undefined : `exit ${res.code}`),
+              lastError: errLine,
               lastRun: new Date().toISOString()
             }
           : x
-      )
+      ),
+      runStats: s.settings.telemetryLocalEnabled
+        ? {
+            ok: s.runStats.ok + (res.ok ? 1 : 0),
+            err: s.runStats.err + (res.ok ? 0 : 1)
+          }
+        : s.runStats,
+      runHistory: [
+        {
+          id: crypto.randomUUID(),
+          taskId: t.id,
+          taskName: t.name,
+          mode: t.mode,
+          commandLine: formatCommandLine(settings.autoRsaExecutable, argsPreview),
+          cwd: envSummary.cwd,
+          ok: res.ok,
+          code: res.code,
+          exitKind: res.exitKind,
+          elapsedSec: Number(elapsedSec),
+          createdAt: new Date().toISOString()
+        },
+        ...(s.runHistory ?? [])
+      ].slice(0, 50)
     }))
-    if (res.error) {
-      appendWithCap(setLog, max, res.error + '\n')
-    }
-    appendWithCap(setLog, max, `\n(exit code ${res.code})\n`)
   } finally {
     if (!opts?.batch) {
       setRunning(false)
@@ -849,9 +1512,9 @@ async function runAll(
   cancelRef: { current: boolean }
 ): Promise<void> {
   if (list.length === 0) return
-  const hasLive = list.some((t) => !t.dry)
+  const hasLive = list.some((t) => !isEffectiveDry(t, settings))
   if (hasLive) {
-    const ok = confirm('Some tasks are not dry runs. Continue for ALL tasks?')
+    const ok = confirm('Some tasks are not dry runs (and global dry mode is off). Continue for ALL tasks?')
     if (!ok) return
   }
   cancelRef.current = false
@@ -863,7 +1526,8 @@ async function runAll(
       }
       const r = await runOne(t, settings, updateStore, setLog, setRunning, {
         batch: true,
-        cancelRef
+        cancelRef,
+        runOpts: resolveRunOpts(t, settings)
       })
       if (r === 'aborted' || r === 'cancelled') {
         break

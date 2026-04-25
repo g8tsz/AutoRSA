@@ -1,3 +1,5 @@
 # Install with: pip install -r requirements.txt
 # Requires Python 3.12+ (see https://github.com/NelsonDane/auto-rsa)
 auto_rsa_bot
+# Bundled Webull path imports pytz but some auto_rsa_bot wheels do not pull it in; keep explicit.
+pytz>=2024.1

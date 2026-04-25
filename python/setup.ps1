@@ -1,3 +1,10 @@
+<#
+  This is a PowerShell *script* — opening it in Notepad or VS Code only shows text.
+  To RUN the installer on Windows, either:
+    - Double-click setup.bat in this same folder, or
+    - Open PowerShell, cd here, then:  .\setup.ps1
+    If you get "running scripts is disabled", use:  powershell -ExecutionPolicy Bypass -File .\setup.ps1
+#>
 $ErrorActionPreference = "Stop"
 $here = $PSScriptRoot
 $venv = Join-Path $here "venv"
@@ -25,15 +32,35 @@ if (-not (Test-Path $venv)) {
     if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create venv" }
 }
 
-$pip = Join-Path $venv "Scripts\pip.exe"
-$python = Join-Path $venv "python.exe"
-& $pip install -U pip
-& $pip install -r (Join-Path $here "requirements.txt")
+# Windows venv puts python.exe in Scripts\; Unix/macOS use bin\python (not venv\python.exe).
+$python = Join-Path $venv "Scripts\python.exe"
+if (-not (Test-Path $python)) {
+    $python = Join-Path $venv "bin\python"
+}
+if (-not (Test-Path $python)) {
+    Write-Error "Could not find venv Python at Scripts\python.exe or bin\python. Delete the venv folder and run this script again."
+}
+# Use "python -m pip" so upgrading pip does not hit "To modify pip, please run …" on Windows.
+& $python -m pip install -U pip
+& $python -m pip install -r (Join-Path $here "requirements.txt")
 Write-Host "Installing Playwright browser deps (if required by brokers)..." -ForegroundColor Cyan
 & $python -m playwright install
+
+# Always ship a Windows launcher so the path is a normal runnable file even if pip
+# skips or removes the console-script .exe (AV, partial install, etc.).
+$cmdPath = Join-Path $venv "Scripts\auto_rsa_bot.cmd"
+$pyAbs = (Resolve-Path $python).Path
+@(
+    '@echo off',
+    "set PYTHONUNBUFFERED=1",
+    "call `"$pyAbs`" -m auto_rsa_bot %*"
+) | Set-Content -Path $cmdPath -Encoding ascii
+
 $exe = Join-Path $venv "Scripts\auto_rsa_bot.exe"
 if (Test-Path $exe) {
     Write-Host "OK: $exe" -ForegroundColor Green
+} elseif (Test-Path $cmdPath) {
+    Write-Host "OK: $cmdPath (runs python -m auto_rsa_bot)" -ForegroundColor Green
 } else {
-    Write-Warning "auto_rsa_bot.exe not found. The package requires Python 3.12+; see pip output above."
+    Write-Warning "auto_rsa_bot launcher not found. The package requires Python 3.12+; see pip output above."
 }

@@ -3,8 +3,12 @@
 @tailwind utilities;
 
 @layer base {
-  :root {
+  :root,
+  :root[data-theme='dark'] {
     color-scheme: dark;
+    --color-surface: 11 11 14;
+    --color-surface-raised: 18 18 22;
+    --color-surface-border: 58 58 66;
   }
   ::-webkit-scrollbar {
     width: 8px;
@@ -16,5 +20,18 @@
   ::-webkit-scrollbar-thumb {
     background: #2a2a32;
     border-radius: 4px;
+  }
+
+  @keyframes arsa-fade-in {
+    from {
+      opacity: 0.88;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  .main-view-fade {
+    animation: arsa-fade-in 0.2s ease-out;
   }
 }

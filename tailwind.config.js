@@ -5,9 +5,9 @@ export default {
     extend: {
       colors: {
         surface: {
-          DEFAULT: '#0f0f12',
-          raised: '#16161c',
-          border: '#2a2a32'
+          DEFAULT: 'rgb(var(--color-surface) / <alpha-value>)',
+          raised: 'rgb(var(--color-surface-raised) / <alpha-value>)',
+          border: 'rgb(var(--color-surface-border) / <alpha-value>)'
         },
         accent: {
           DEFAULT: '#6366f1',
