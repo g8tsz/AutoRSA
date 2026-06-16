@@ -10,6 +10,12 @@
     --color-surface-raised: 18 18 22;
     --color-surface-border: 58 58 66;
   }
+  :root[data-theme='light'] {
+    color-scheme: light;
+    --color-surface: 250 250 252;
+    --color-surface-raised: 255 255 255;
+    --color-surface-border: 212 212 220;
+  }
   ::-webkit-scrollbar {
     width: 8px;
     height: 8px;

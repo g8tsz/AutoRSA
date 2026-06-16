@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { AppSettings } from './types'
 import { healthLevel, type PathStatus } from './hooks/useEnvironmentHealth'
 import { BROKER_DOCS, UPSTREAM_RELEASES_URL } from './lib/brokerDocs'
+import { BrokerReadinessPanel } from './components/BrokerReadinessPanel'
 
 type Props = {
   settings: AppSettings
@@ -117,10 +118,21 @@ export function SettingsPanel({ settings, onChange, pathStatus, runStats }: Prop
     upToDate: boolean | null
     detail: string
   } | null>(null)
+  const [envKeys, setEnvKeys] = useState<string[]>([])
+  const [envEditOpen, setEnvEditOpen] = useState(false)
+  const [envContent, setEnvContent] = useState('')
+  const [envSaveMsg, setEnvSaveMsg] = useState<string | null>(null)
 
   useEffect(() => {
     void window.api.envVersionStatus().then(setVersionStatus)
-  }, [])
+    void window.api.envSummary({ envDirectory: settings.envDirectory }).then((r) => setEnvKeys(r.keys))
+  }, [settings.envDirectory])
+
+  useEffect(() => {
+    if (envEditOpen) {
+      void window.api.envRead({ envDirectory: settings.envDirectory }).then((r) => setEnvContent(r.raw))
+    }
+  }, [envEditOpen, settings.envDirectory])
 
   return (
     <div className="space-y-4 pb-8 text-sm text-zinc-300">
@@ -183,9 +195,23 @@ export function SettingsPanel({ settings, onChange, pathStatus, runStats }: Prop
         <strong>dry run</strong> and the confirmation dialogs here before live orders.
       </p>
 
+      <SettingsCard title="Appearance" description="Theme preference (stored locally).">
+        <label className="flex items-center gap-2 text-sm text-zinc-300">
+          Theme
+          <select
+            className="rounded border border-surface-border bg-[#0c0c0e] px-2 py-1 text-xs"
+            value={settings.theme}
+            onChange={(e) => onChange({ ...settings, theme: e.target.value as 'dark' | 'light' })}
+          >
+            <option value="dark">Dark</option>
+            <option value="light">Light</option>
+          </select>
+        </label>
+      </SettingsCard>
+
       <SettingsCard
         title="Safety & automation"
-        description="Global dry mode and optional retries. Local counters stay on this machine only."
+        description="Global dry mode, batch behavior, retries, and risk limits."
       >
         <label className="flex cursor-pointer items-start gap-2 text-zinc-300">
           <input
@@ -268,25 +294,124 @@ export function SettingsPanel({ settings, onChange, pathStatus, runStats }: Prop
             <span className="text-sm">Block oversized live buy/sell orders</span>
           </label>
           {settings.riskGuard.enabled && (
-            <div className="ml-6 mt-2">
-              <div className="text-[11px] text-zinc-500">Max shares per live order</div>
-              <input
-                type="number"
-                min={1}
-                className="mt-0.5 w-24 rounded border border-surface-border bg-[#0c0c0e] px-2 py-1 font-mono text-xs"
-                value={settings.riskGuard.maxSharesPerOrder}
-                onChange={(e) =>
-                  onChange({
-                    ...settings,
-                    riskGuard: {
-                      ...settings.riskGuard,
-                      maxSharesPerOrder: Math.max(1, Math.floor(Number(e.target.value) || 1))
-                    }
-                  })
-                }
-              />
+            <div className="ml-6 mt-2 space-y-2">
+              <div>
+                <div className="text-[11px] text-zinc-500">Max shares per live order</div>
+                <input
+                  type="number"
+                  min={1}
+                  className="mt-0.5 w-24 rounded border border-surface-border bg-[#0c0c0e] px-2 py-1 font-mono text-xs"
+                  value={settings.riskGuard.maxSharesPerOrder}
+                  onChange={(e) =>
+                    onChange({
+                      ...settings,
+                      riskGuard: {
+                        ...settings.riskGuard,
+                        maxSharesPerOrder: Math.max(1, Math.floor(Number(e.target.value) || 1))
+                      }
+                    })
+                  }
+                />
+              </div>
+              <div>
+                <div className="text-[11px] text-zinc-500">Max live orders per batch</div>
+                <input
+                  type="number"
+                  min={1}
+                  className="mt-0.5 w-24 rounded border border-surface-border bg-[#0c0c0e] px-2 py-1 font-mono text-xs"
+                  value={settings.riskGuard.maxLiveOrdersPerBatch}
+                  onChange={(e) =>
+                    onChange({
+                      ...settings,
+                      riskGuard: {
+                        ...settings.riskGuard,
+                        maxLiveOrdersPerBatch: Math.max(1, Math.floor(Number(e.target.value) || 1))
+                      }
+                    })
+                  }
+                />
+              </div>
+              <div>
+                <div className="text-[11px] text-zinc-500">Max total live shares per ticker (batch)</div>
+                <input
+                  type="number"
+                  min={1}
+                  className="mt-0.5 w-24 rounded border border-surface-border bg-[#0c0c0e] px-2 py-1 font-mono text-xs"
+                  value={settings.riskGuard.maxTotalSharesPerTicker}
+                  onChange={(e) =>
+                    onChange({
+                      ...settings,
+                      riskGuard: {
+                        ...settings.riskGuard,
+                        maxTotalSharesPerTicker: Math.max(1, Math.floor(Number(e.target.value) || 1))
+                      }
+                    })
+                  }
+                />
+              </div>
+              <label className="flex items-center gap-2 text-[11px] text-zinc-400">
+                <input
+                  type="checkbox"
+                  checked={settings.riskGuard.requireTypedConfirmForLive}
+                  onChange={(e) =>
+                    onChange({
+                      ...settings,
+                      riskGuard: {
+                        ...settings.riskGuard,
+                        requireTypedConfirmForLive: e.target.checked
+                      }
+                    })
+                  }
+                />
+                Require typing LIVE to confirm live orders
+              </label>
             </div>
           )}
+        </div>
+        <label className="flex cursor-pointer items-start gap-2 text-zinc-300">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={settings.batchContinueOnError}
+            onChange={(e) => onChange({ ...settings, batchContinueOnError: e.target.checked })}
+          />
+          <span className="text-sm">Continue batch after task errors</span>
+        </label>
+        <div>
+          <div className="text-[11px] text-zinc-500">Stagger delay between batch tasks (seconds)</div>
+          <input
+            type="number"
+            min={0}
+            className="mt-0.5 w-24 rounded border border-surface-border bg-[#0c0c0e] px-2 py-1 font-mono text-xs"
+            value={settings.staggerDelaySec}
+            onChange={(e) =>
+              onChange({
+                ...settings,
+                staggerDelaySec: Math.max(0, Math.floor(Number(e.target.value) || 0))
+              })
+            }
+          />
+        </div>
+        <div>
+          <div className="text-[11px] text-zinc-500">Per-broker timeout overrides (broker:seconds, comma-separated)</div>
+          <input
+            className="mt-0.5 w-full rounded border border-surface-border bg-[#0c0c0e] px-2 py-1 font-mono text-xs"
+            placeholder="robinhood:7200,schwab:3600"
+            value={Object.entries(settings.perBrokerTimeoutSec)
+              .map(([k, v]) => `${k}:${v}`)
+              .join(',')}
+            onChange={(e) => {
+              const map: Record<string, number> = {}
+              for (const part of e.target.value.split(',')) {
+                const [b, s] = part.split(':').map((x) => x.trim())
+                if (b && s) {
+                  const n = Math.floor(Number(s))
+                  if (n > 0) map[b.toLowerCase()] = n
+                }
+              }
+              onChange({ ...settings, perBrokerTimeoutSec: map })
+            }}
+          />
         </div>
       </SettingsCard>
 
@@ -336,8 +461,53 @@ export function SettingsPanel({ settings, onChange, pathStatus, runStats }: Prop
         </div>
       </SettingsCard>
 
-      <SettingsCard
-        title="Paths & credentials"
+      <SettingsCard title="Broker readiness" description="Which brokers have .env keys configured.">
+        <BrokerReadinessPanel envKeys={envKeys} />
+      </SettingsCard>
+
+      <SettingsCard title=".env editor" description="Edit credentials in the working directory (main process only; values stay local).">
+        <p className="text-[11px] text-amber-200/80">
+          Warning: storing broker credentials in .env carries risk. Never share this file.
+        </p>
+        <button
+          type="button"
+          className="mt-2 rounded-md border border-surface-border bg-zinc-800 px-2 py-1 text-xs"
+          onClick={() => setEnvEditOpen((v) => !v)}
+        >
+          {envEditOpen ? 'Close editor' : 'Open .env editor'}
+        </button>
+        {envEditOpen && (
+          <div className="mt-2 space-y-2">
+            <textarea
+              className="h-48 w-full rounded border border-surface-border bg-[#0c0c0e] p-2 font-mono text-[11px] text-zinc-300"
+              value={envContent}
+              onChange={(e) => setEnvContent(e.target.value)}
+            />
+            <div className="flex gap-2">
+              <button
+                type="button"
+                className="rounded-md bg-accent px-2 py-1 text-xs text-white"
+                onClick={async () => {
+                  const r = await window.api.envWrite({
+                    envDirectory: settings.envDirectory,
+                    content: envContent
+                  })
+                  setEnvSaveMsg(r.ok ? 'Saved.' : r.error ?? 'Failed')
+                  if (r.ok) {
+                    const sum = await window.api.envSummary({ envDirectory: settings.envDirectory })
+                    setEnvKeys(sum.keys)
+                  }
+                }}
+              >
+                Save .env
+              </button>
+              {envSaveMsg && <span className="text-[11px] text-zinc-500">{envSaveMsg}</span>}
+            </div>
+          </div>
+        )}
+      </SettingsCard>
+
+      <SettingsCard title="Paths & credentials"
         description="Working directory is cwd for each run (.env, creds/). The bot executable lives in the repo venv unless you override it below."
       >
         <div>
@@ -574,6 +744,27 @@ export function SettingsPanel({ settings, onChange, pathStatus, runStats }: Prop
           onClick={() => void window.api.openExternal(UPSTREAM_RELEASES_URL)}
         >
           Open upstream releases/changelog
+        </button>
+        <button
+          type="button"
+          className="ml-2 w-fit rounded-md border border-surface-border bg-zinc-800 px-2 py-1 text-xs hover:bg-zinc-700"
+          onClick={async () => {
+            const r = await window.api.envUpgrade()
+            setDoctorOutput(r.output)
+            setVersionStatus(await window.api.envVersionStatus())
+          }}
+        >
+          Update auto_rsa_bot (pip upgrade)
+        </button>
+        <button
+          type="button"
+          className="ml-2 w-fit rounded-md border border-surface-border bg-zinc-800 px-2 py-1 text-xs hover:bg-zinc-700"
+          onClick={async () => {
+            const r = await window.api.checkUpdates()
+            alert(r.detail)
+          }}
+        >
+          Check app updates
         </button>
       </SettingsCard>
 

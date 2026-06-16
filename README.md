@@ -2,6 +2,26 @@
 
 Desktop app (Electron) that provides a **task-based UI** around **[AutoRSA](https://github.com/NelsonDane/auto-rsa)** / `auto_rsa_bot` for **buy**, **sell**, and **holdings** across the brokerages that upstream supports.
 
+## What's new in 1.1
+
+- **Run broker picker** for `all` tasks (per-run broker selection)
+- **Alt+D / Alt+T / Alt+S** navigation shortcuts
+- **Nested task groups** via sub-groups
+- **Batch progress**, **run selected**, **task reorder**, **import/export**
+- **In-app confirm modals** (replacing native dialogs) + live-order disclaimer
+- **Broker checkbox picker** in task editor, **templates**, **undo delete**
+- **Structured holdings** in output + **holdings diff** across snapshots
+- **Scheduled daily runs** (Settings; app must be open)
+- **Log filter**, **save log**, **resizable output panel**
+- **Light theme**, **broker readiness panel**, **.env editor**
+- **Extended risk guard**, batch continue/stagger, per-broker timeouts
+- **Process tree kill**, **single-instance lock**, **atomic store writes**
+- **PyPI version check**, **one-click pip upgrade**, **electron-builder** + auto-update
+- **macOS/Linux** `python/setup.sh`, pinned `auto_rsa_bot==2.1.0`
+- **CI**, **ESLint/Prettier**, expanded tests, [architecture docs](docs/ARCHITECTURE.md)
+
+Screenshots: see [docs/screenshots](docs/screenshots/README.md).
+
 ## Requirements
 
 - **Node.js** 18 or newer (includes `npm`)
@@ -59,6 +79,14 @@ Wait until the terminal shows that the Vite dev server and Electron are starting
 npm run build
 npm start
 ```
+
+**Windows installer (electron-builder):**
+
+```bash
+npm run dist
+```
+
+Optional dev DevTools: `ARSA_OPEN_DEVTOOLS=1 npm run dev`
 
 ## How to use the UI
 

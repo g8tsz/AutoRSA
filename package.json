@@ -1,33 +1,84 @@
 {
   "name": "auto-rsa-desktop",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Desktop UI for AutoRSA multi-brokerage automation",
   "type": "module",
   "main": "out/main/index.js",
-  "author": "",
+  "author": "g8tsz",
   "license": "GPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/g8tsz/AutoRSA.git"
+  },
+  "homepage": "https://github.com/g8tsz/AutoRSA#readme",
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "start": "electron .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "lint": "eslint \"src/**/*.{ts,tsx}\"",
+    "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder"
   },
-  "dependencies": {},
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
     "@vitejs/plugin-react": "^4.3.3",
     "autoprefixer": "^10.4.20",
     "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
     "electron-vite": "^2.3.0",
+    "eslint": "^9.16.0",
+    "eslint-plugin-react-hooks": "^5.1.0",
     "postcss": "^8.4.49",
+    "prettier": "^3.4.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "tailwindcss": "^3.4.15",
     "typescript": "^5.6.3",
     "vite": "^5.4.10",
     "vitest": "^2.1.5"
+  },
+  "build": {
+    "appId": "com.autorsa.desktop",
+    "productName": "AutoRSA Desktop",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "python",
+        "to": "python",
+        "filter": ["**/*", "!venv/**"]
+      }
+    ],
+    "win": {
+      "target": ["nsis"],
+      "artifactName": "AutoRSA-Setup-${version}.${ext}"
+    },
+    "mac": {
+      "target": ["dmg"]
+    },
+    "linux": {
+      "target": ["AppImage"]
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "g8tsz",
+      "repo": "AutoRSA"
+    }
   }
 }

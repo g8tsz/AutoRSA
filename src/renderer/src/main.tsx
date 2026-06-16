@@ -3,7 +3,12 @@ import { createRoot } from 'react-dom/client'
 import App from './App'
 import './index.css'
 
-document.documentElement.dataset.theme = 'dark'
+try {
+  const saved = localStorage.getItem('arsa_theme')
+  document.documentElement.dataset.theme = saved === 'light' ? 'light' : 'dark'
+} catch {
+  document.documentElement.dataset.theme = 'dark'
+}
 
 const el = document.getElementById('root')
 if (!el) {
